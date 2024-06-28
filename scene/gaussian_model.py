@@ -8,18 +8,25 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-
+import json
 import torch
+import torchaudio
 import numpy as np
+import matplotlib.pyplot as plt
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
 from utils.system_utils import mkdir_p
+from utils.plotting_audio_maps import *
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from audio_map import *
+
+import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 class GaussianModel:
 
@@ -56,6 +63,9 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+
+        self.audio_intensity = 0
+
         self.setup_functions()
 
     def capture(self):
@@ -71,7 +81,7 @@ class GaussianModel:
             self.xyz_gradient_accum,
             self.denom,
             self.optimizer.state_dict(),
-            self.spatial_lr_scale,
+            self.spatial_lr_scale
         )
     
     def restore(self, model_args, training_args):
@@ -186,10 +196,23 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        for i in range(1):
+            l.append('audio_intense_{}'.format(i))
         return l
 
-    def save_ply(self, path):
+    def save_ply(self, path, scene_audio, json_cams, output_path):
         mkdir_p(os.path.dirname(path))
+
+        cameras_postprocessed = []
+        for camera in json_cams:
+
+            rotation_matrix = np.array(camera["rotation"])
+            r11, r13  = rotation_matrix[0, 0], rotation_matrix[0, 2]
+            # Compute the rotation angle around the Y-axis
+            theta_y = np.arctan2(r13, r11)
+            # Convert the angle from radians to degrees for better interpretation
+            theta_y_degrees = np.degrees(theta_y)
+            cameras_postprocessed.append([theta_y_degrees, [camera["position"][0], camera["position"][2]]])
 
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
@@ -199,13 +222,63 @@ class GaussianModel:
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
+        (
+            self.audio_intensities, 
+            grid_points, 
+            indicator_values, 
+            receiver_positions, 
+            receiver_rotations 
+        ) = self.build_audio_map(cameras_postprocessed, scene_audio, xyz)
+
+        print('\n Plotting audio map \n')
+
+        plot_audio_maps(
+            self.audio_intensities, 
+            grid_points, 
+            indicator_values, 
+            receiver_positions, 
+            receiver_rotations,
+            output_path
+        )
+
+        for i in range(len(self.audio_intensities)):
+            if self.audio_intensities[i] > 0.95:
+                pass
+
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, self.audio_intensities.reshape(-1, 1)), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
+
+    def build_audio_map(self, cameras_postprocessed, scene_audio, grid_points):
+
+        left_channel, right_channel = scene_audio
+
+        receiver_positions = np.array([_[1] for _ in cameras_postprocessed])
+        receiver_rotations = -np.array([_[0] for _ in cameras_postprocessed]) + 90
+
+        grid_points = np.array(grid_points)[:, [0, 2]]
+
+        audio_map_builder = AudioMapBuilder(
+            left_channel, 
+            right_channel, 
+            receiver_positions,
+            receiver_rotations,
+            grid_points  
+        )
+
+        (   
+            confidence_coefficients, 
+            louder_sides, 
+            rms_left_history, 
+            rms_right_history, 
+            indicator_values
+        ) = audio_map_builder.compute_confidence_coefficients()
+
+        return confidence_coefficients, grid_points, indicator_values, receiver_positions, receiver_rotations
 
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
